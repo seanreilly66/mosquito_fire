@@ -1,0 +1,34 @@
+name: mosquito_fire
+channels:
+  - conda-forge
+dependencies:
+  # Python core
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - dask
+  - scipy
+
+  # Geo stack
+  - gdal=3.8.*        # GDAL 3.8.x for PDAL compatibility
+  - proj=9.3.*
+  - geos=3.12.*
+  - rasterio=1.3.*
+  - rioxarray=0.15.*
+  - xarray
+  - geopandas
+  - shapely
+  - fiona
+
+  # Point clouds
+  - pdal=2.6.*
+  - python-pdal
+
+  # Utilities
+  - aria2
+  - pyyaml
+  - tqdm
+  - click
+  - pystac
+
