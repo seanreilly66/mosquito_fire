@@ -1,0 +1,36 @@
+__pycache__/
+.ipynb_checkpoints/
+.env
+.venv
+.DS_Store
+*.log
+
+# Python / R
+__pycache__/
+.ipynb_checkpoints/
+.venv
+.Rproj.user/
+.Rhistory
+.RData
+.Renviron
+
+# Logs & build
+*.log
+dist/
+build/
+
+# OS cruft
+.DS_Store
+
+02_normalized/
+03_derivatives/
+04_burn_severity/
+05_outputs/
+*.tif
+*.tiff
+*.vrt
+*.las
+*.laz
+*.zip
+*.7z
+*.tar

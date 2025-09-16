@@ -1,0 +1,24 @@
+project_name: mosquito_fire
+data_root: /mnt/d/mosquito_fire
+data_root_ms: D:/mosquito_fire
+crs: EPSG:6339               # NAD83(2011) / UTM 10N
+
+
+dtm_resolution: 1.0          # meters for DTM tiles
+make_chm: true
+chm_resolution: 0.25
+chm_smooth: true
+
+pdal_threads: 8
+aria2_connections: 16
+
+wesm_file: /mnt/d/mosquito_fire/00_manifests/WESM.csv
+selection_file: /mnt/d/mosquito_fire/00_manifests/mosquito_usgs_ca_sierra_nevada_tiles.csv
+wesm_workunit_col: WU_NAME           # column in WESM that names the work unit
+wesm_lpc_link_col: lpc_link          # column in WESM with the directory URL
+sel_workunit_col: WU_NAME            # column in mosquito_usgs mapping work unit
+sel_tileid_col: Tile_ID              # column in mosquito_usgs with the tile ID (e.g., 10SFJ7740)
+
+burn_file: 10_burn/mosquito_rdnbr_mtbs.tif
+norm_lidar_folder: 02_normalized
+las_metric_function: scripts/las_metric_function.R
