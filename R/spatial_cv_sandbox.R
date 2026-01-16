@@ -1,388 +1,220 @@
 suppressPackageStartupMessages({
-  library(tidyverse)
-  library(terra)
-  # library(tidymodels)
-  # library(spatialsample)
   library(sf)
-
+  library(bit)
+  library(rsample)
+  library(tibble)
 })
 
-# ==============================================================================
-# Testing data
-# ==============================================================================
+# =============================================================================
+# Minimal exact spatial resampling with point-level buffering (predicts + sf + bit + rsample)
+# Four functions: fun_1 .. fun_4
+# Assumptions: ROI/points are valid sf objects in a projected CRS (meters),
+#              points all lie within ROI, and divider partitions ROI cleanly.
+# =============================================================================
 
-burn_file  <- 'data/burn_severity/mosquito_rdnbr_mtbs.tif'     # RdNBR response
-metric_dir <- "data/fuelrasters"            # predictor rasters
+# ------------------------------- fun_1 ---------------------------------------
+# Divide ROI into n blocks using predicts::divider (seeded),
+# buffer each block by buffer_dist,
+# assign points to blocks and to buffered blocks,
+# return incl_bits and excl_bits (bitsets per block).
 
-roi_gpkg = 'data/mosquito_fire.gpkg'
-roi_layer = 'mosquito_study_area'
-
-initial_prop = 0.2
-v_folds = 10
-blocks_per_fold = 5
-tune_reps = 30
-fit_reps = 100
-buffer_dist = 2000
-
-# ------------------------------------------------------------------------------
-# Read data
-# ------------------------------------------------------------------------------
-
-roi <- vect(roi_gpkg, roi_layer)
-
-burn_rast <- rast(burn_file) %>%
-  crop(roi) %>%
-  mask(roi)
-names(burn_rast) <- 'rdnbr'
-
-pred_rast <- rast(list.files(metric_dir, pattern="\\.tif$", full.names=TRUE)) %>%
-  crop(roi) %>%
-  mask(roi)
-
-input_df <- c(burn_rast, pred_rast) %>%
-  crop(roi) %>%
-  mask(roi) %>%
-  as.points() %>%
-  st_as_sf() %>%
-  mutate(st_coordinates(geometry) |> as_tibble()) %>%
-  slice_sample(n = 10000)
-
-v = v_folds
-bpf = blocks_per_fold
-buffer = 2000
-seeds = c(7127)
-
-# ==============================================================================
-
-cellsize = 2*(sqrt(2*st_area(roi)/(3*sqrt(3)*v*bpf)))
-
-
-spatial_cv <- function(sf_df, roi, v, bpf, buffer, seeds) {
+fun_1 <- function(roi, points, n_blocks, buffer_dist = 2000, seed = 1) {
+  
+  # Block and point prep
   
   if (!inherits(roi, "SpatVector")) {
-    roi = vect(roi)
+    roi = terra::vect(roi)
   }
   
-  set.seed(seeds[1])
-  blocks = predicts::divider(roi, n = v * bpf) %>%
-    st_as_sf() %>%
-    mutate(block_id = row_number())
+  set.seed(seed)
+  blocks = predicts::divider(roi, n = n_blocks) |>
+    st_as_sf() 
   
-  buffer_blocks = blocks %>%
+  blocks$block_id <- seq_len(nrow(blocks))
+  
+  blocks_buf = blocks %>%
     st_buffer(dist = buffer)
   
-  pts_id
+  points$.pt_id <- seq_len(nrow(points))
+  n_points <- nrow(points)
+  
+  # Inclusion: point to block assignment
+  
+  tictoc::tic()
+  incl_list <- st_contains(blocks, points, sparse = TRUE) |>
+    lapply(function(i) points$.pt_id[i])
+  
+  names(incl_list) <- as.character(blocks$block_id)
+  tictoc::toc()
+  
+  # Exclusion: point is within buffer(block)
+
+  tictoc::tic()
+  excl_list <- st_contains(blocks_buf, points, sparse = TRUE) |>
+    lapply(function(i) points$.pt_id[i])
+  
+  names(excl_list) <- as.character(blocks_buf$block_id)
+  tictoc::toc()
+
   
   
+  # Convert lists to packed bitsets (1 bit per point per block)
+  incl_bits <- vector("list", n_blocks); names(incl_bits) <- as.character(blocks$block_id)
+  excl_bits <- vector("list", n_blocks); names(excl_bits) <- as.character(blocks$block_id)
   
-  
-  
-  
-}
-
-
-
-
-# =============================================================================
-# Exact spatial CV with point-level 2 km exclusion buffer (sf + terra)
-# Precompute once; generate ~1300 splits with set algebra (no per-split geometry)
-# =============================================================================
-
-suppressPackageStartupMessages({
-  library(sf)
-  library(terra)
-  library(data.table)
-})
-
-# -----------------------------------------------------------------------------
-# 0) Helpers
-# -----------------------------------------------------------------------------
-
-assert_projected_meters <- function(x) {
-  cr <- sf::st_crs(x)
-  if (is.na(cr$wkt)) stop("CRS missing.")
-  if (sf::st_is_longlat(x)) {
-    stop("Geometry is lon/lat. Reproject to a meter-based projected CRS (UTM/Albers).")
-  }
-  invisible(TRUE)
-}
-
-as_sorted_unique_int <- function(x) sort(unique(as.integer(x)))
-
-union_int_lists <- function(lst) {
-  # Fast-enough baseline: concatenate -> sort -> unique
-  # For bigger workloads, see bitset option further down.
-  if (length(lst) == 0) return(integer())
-  as_sorted_unique_int(unlist(lst, use.names = FALSE))
-}
-
-int_setdiff <- function(universe, remove) {
-  # universe must be sorted unique
-  # remove should be sorted unique
-  if (length(remove) == 0) return(universe)
-  universe[!fmatch::fmatch(universe, remove, nomatch = 0L) > 0L]
-}
-
-# -----------------------------------------------------------------------------
-# 1) Build blocks (grid clipped to ROI)
-# -----------------------------------------------------------------------------
-build_blocks <- function(roi_sf, block_size_m, block_id_col = "block_id") {
-  assert_projected_meters(roi_sf)
-  
-  # Create a square grid over ROI bbox; clip to ROI
-  g <- sf::st_make_grid(roi_sf, cellsize = block_size_m, square = TRUE)
-  blocks <- sf::st_sf(geometry = g)
-  blocks <- sf::st_intersection(blocks, sf::st_union(roi_sf))
-  blocks <- blocks[!sf::st_is_empty(blocks), , drop = FALSE]
-  blocks[[block_id_col]] <- seq_len(nrow(blocks))
-  
-  # Ensure valid geometries
-  blocks <- sf::st_make_valid(blocks)
-  
-  blocks
-}
-
-# -----------------------------------------------------------------------------
-# 2) Generate point centers from a terra SpatRaster (30 m) restricted to ROI
-#    (If you already have points, skip this and provide an sf POINT object)
-# -----------------------------------------------------------------------------
-raster_to_points_sf <- function(r, roi_sf = NULL, keep_cell_id = TRUE) {
-  # r: terra SpatRaster (any layers; we only need geometry)
-  # Returns sf POINT with pt_id and optional cell index
-  if (!inherits(r, "SpatRaster")) stop("r must be a terra SpatRaster.")
-  
-  # Convert raster cells to points (centers); keep only non-NA in first layer
-  # For a pure index raster, set all cells non-NA first.
-  pts <- terra::as.points(r, values = FALSE, na.rm = TRUE)
-  
-  if (!is.null(roi_sf)) {
-    assert_projected_meters(roi_sf)
-    roi_v <- terra::vect(roi_sf)
-    pts <- terra::crop(pts, roi_v)
-    pts <- terra::mask(pts, roi_v)
+  for (b in names(incl_bits)) {
+    bv <- bit(n_points)
+    idx <- incl_list[[b]]
+    if (length(idx)) bv[idx] <- TRUE
+    incl_bits[[b]] <- bv
   }
   
-  # Build sf points
-  sf_pts <- sf::st_as_sf(pts)
-  
-  if (keep_cell_id) {
-    # terra points include cell index in "cell" only if values kept;
-    # If absent, create pt_id only.
-    sf_pts$pt_id <- seq_len(nrow(sf_pts))
-  } else {
-    sf_pts$pt_id <- seq_len(nrow(sf_pts))
+  for (b in names(excl_bits)) {
+    bv <- bit(n_points)
+    idx <- excl_list[[b]]
+    if (length(idx)) bv[idx] <- TRUE
+    excl_bits[[b]] <- bv
   }
   
-  sf_pts
-}
-
-# -----------------------------------------------------------------------------
-# 3) One-time: point -> block membership (assessment membership)
-# -----------------------------------------------------------------------------
-precompute_pts_in_block <- function(points_sf, blocks_sf,
-                                    pt_id_col = "pt_id",
-                                    block_id_col = "block_id") {
-  assert_projected_meters(points_sf)
-  assert_projected_meters(blocks_sf)
-  
-  # Spatial join: each point within exactly one block (after clipping)
-  joined <- sf::st_join(
-    points_sf[, pt_id_col, drop = FALSE],
-    blocks_sf[, block_id_col, drop = FALSE],
-    join = sf::st_within,
-    left = FALSE
-  )
-  
-  if (nrow(joined) == 0) stop("No point-block matches. Check CRS / extents / ROI clipping.")
-  
-  dt <- as.data.table(sf::st_drop_geometry(joined))
-  setnames(dt, c(pt_id_col, block_id_col), c("pt_id", "block_id"))
-  
-  # pts_in_block: list(block_id -> integer pt_ids)
-  pts_in_block <- dt[, .(pt_id = as_sorted_unique_int(pt_id)), by = block_id][
-    order(block_id)
-  ]
-  
-  # Return list + a point->block vector if needed
-  pt_block <- dt[order(pt_id), block_id]
-  names(pt_block) <- dt[order(pt_id), pt_id]
+  points$.pt_id <- NULL
   
   list(
-    pts_in_block = setNames(pts_in_block$pt_id, pts_in_block$block_id),
-    pt_block = pt_block
+    points = points,
+    blocks = blocks,
+    blocks_buffer = blocks_buf,
+    n_points = n_points,
+    n_blocks = n_blocks,
+    buffer_dist = buffer_dist,
+    seed = seed,
+    incl_bits = incl_bits,
+    excl_bits = excl_bits
   )
 }
 
-# -----------------------------------------------------------------------------
-# 4) One-time: point -> buffered-block membership (exclusion engine)
-#     pts_in_buf[[b]] = all points within buffer(block_b, 2000 m)
-# -----------------------------------------------------------------------------
-precompute_pts_in_buf <- function(points_sf, blocks_sf,
-                                  buffer_m = 2000,
-                                  pt_id_col = "pt_id",
-                                  block_id_col = "block_id") {
-  assert_projected_meters(points_sf)
-  assert_projected_meters(blocks_sf)
+# ------------------------------- fun_2 ---------------------------------------
+# initial_split-like function:
+# calls fun_1, selects ~ (1-prop) points worth of blocks as assessment,
+# returns an rsplit like rsample::initial_split.
+fun_2 <- function(roi, points, n_blocks, buffer_dist = 2000, prop = 0.75, seed = 1) {
+  bits <- fun_1(roi, points, n_blocks, buffer_dist, seed)
   
-  blocks_buf <- sf::st_buffer(sf::st_make_valid(blocks_sf), dist = buffer_m)
-  
-  # st_intersects returns sparse list: for each point, which buffered blocks contain it
-  hits <- sf::st_intersects(points_sf, blocks_buf, sparse = TRUE)
-  
-  pt_ids <- points_sf[[pt_id_col]]
-  if (is.null(pt_ids)) stop("pt_id_col not found on points_sf.")
-  
-  # Build a long table: (pt_id, block_id_hit)
-  # This inverts the point->blocks list into block->points list.
-  lens <- lengths(hits)
-  if (sum(lens) == 0) stop("No point-buffer hits. Check buffer/CRS/geometry.")
-  
-  dt <- data.table(
-    pt_id = rep.int(pt_ids, lens),
-    block_id = as.integer(unlist(hits, use.names = FALSE))
-  )
-  
-  # Map numeric index back to actual block_id values
-  # Because blocks_buf is in the same row order as blocks_sf
-  block_ids <- blocks_sf[[block_id_col]]
-  dt[, block_id := block_ids[block_id]]
-  
-  pts_in_buf <- dt[, .(pt_id = as_sorted_unique_int(pt_id)), by = block_id][
-    order(block_id)
-  ]
-  
-  setNames(pts_in_buf$pt_id, pts_in_buf$block_id)
-}
-
-# -----------------------------------------------------------------------------
-# 5) Repeated fold assignment at block level
-# -----------------------------------------------------------------------------
-make_block_folds <- function(block_ids, v = 10L, reps = 1L, seed = 1L) {
   set.seed(seed)
-  block_ids <- as.integer(block_ids)
-  n <- length(block_ids)
+  target <- round((1 - prop) * bits$n_points)
   
-  # For each rep, permute blocks and assign folds as evenly as possible
-  folds_by_rep <- vector("list", reps)
+  perm <- sample(seq_len(bits$n_blocks))
+  test_blocks <- integer()
+  test_mask <- bit(bits$n_points)
   
-  for (r in seq_len(reps)) {
-    perm <- sample(block_ids, size = n, replace = FALSE)
-    fold <- rep.int(seq_len(v), length.out = n)
-    # map: block_id -> fold
-    m <- integer(max(block_ids))
-    m[perm] <- fold
-    folds_by_rep[[r]] <- m
+  for (b in perm) {
+    cand <- test_mask | bits$incl_bits[[as.character(b)]]
+    if (sum(cand) <= target || length(test_blocks) == 0) {
+      test_mask <- cand
+      test_blocks <- c(test_blocks, b)
+    }
+    if (sum(test_mask) >= target) break
   }
   
-  folds_by_rep
+  assess_idx <- which(as.logical(test_mask))
+  
+  excl_mask <- Reduce(`|`, bits$excl_bits[as.character(test_blocks)])
+  train_idx <- which(!as.logical(excl_mask))
+  
+  sp <- rsample::make_splits(
+    x = list(analysis = train_idx, assessment = assess_idx),
+    data = bits$points,
+    class = c("spatial_rsplit")
+  )
+  class(sp) <- c("initial_split", class(sp))
+  sp
 }
 
-# -----------------------------------------------------------------------------
-# 6) Split generation (exact) using precomputed lists
-# -----------------------------------------------------------------------------
-make_split <- function(folds_map, k,
-                       pts_in_block, pts_in_buf,
-                       all_pt_ids = NULL) {
-  # folds_map: integer vector indexed by block_id giving fold id
-  # k: fold number
-  # pts_in_block: list(block_id -> integer pt_ids)
-  # pts_in_buf:   list(block_id -> integer pt_ids within 2 km buffer)
-  # all_pt_ids: optional sorted unique integer vector of all point ids
+# ------------------------------- fun_3 ---------------------------------------
+# Generate repeated CV fold assignments at block-level using fun_1.
+# n_blocks = v * blocks_per_fold.
+# Returns: bits + fold_maps[[rep]] = integer vector (block_id -> fold 1..v).
+fun_3 <- function(roi, points, v = 10, blocks_per_fold, repeats = 1,
+                  buffer_dist = 2000, seed = 1) {
+  n_blocks <- v * blocks_per_fold
+  bits <- fun_1(roi, points, n_blocks, buffer_dist, seed)
   
-  # Assessment blocks for fold k
-  block_ids <- which(folds_map == k)
-  if (length(block_ids) == 0) stop("No blocks assigned to fold ", k)
+  set.seed(seed)
+  fold_maps <- vector("list", repeats)
   
-  # Assessment points: union of points in those blocks
-  assess_pts <- union_int_lists(pts_in_block[as.character(block_ids)])
-  
-  # Excluded points: union of points in buffers of those blocks
-  excluded_pts <- union_int_lists(pts_in_buf[as.character(block_ids)])
-  
-  if (is.null(all_pt_ids)) {
-    # derive from pts_in_block if not supplied
-    all_pt_ids <- as_sorted_unique_int(unlist(pts_in_block, use.names = FALSE))
+  for (r in seq_len(repeats)) {
+    perm <- sample(seq_len(n_blocks))
+    folds <- rep(seq_len(v), each = blocks_per_fold)
+    fold_map <- integer(n_blocks)
+    fold_map[perm] <- folds
+    fold_maps[[r]] <- fold_map
   }
-  
-  # Training points are all points minus excluded points
-  train_pts <- setdiff(all_pt_ids, excluded_pts)
   
   list(
-    assess_blocks = block_ids,
-    assess_pts = assess_pts,
-    excluded_pts = excluded_pts,
-    train_pts = train_pts
+    bits = bits,
+    v = v,
+    blocks_per_fold = blocks_per_fold,
+    repeats = repeats,
+    seed = seed,
+    fold_maps = fold_maps
   )
 }
 
-# -----------------------------------------------------------------------------
-# 7) Optional: build a compact split manifest for downstream frameworks
-# -----------------------------------------------------------------------------
-split_manifest <- function(rep_id, fold_id, split_obj) {
-  data.table(
-    rep = rep_id,
-    fold = fold_id,
-    pt_id = c(split_obj$train_pts, split_obj$assess_pts),
-    role = c(rep.int("train", length(split_obj$train_pts)),
-             rep.int("assess", length(split_obj$assess_pts)))
+# ------------------------------- fun_4 ---------------------------------------
+# Convert fold assignments from fun_3 into an rset compatible with tidymodels,
+# and with spatialsample::autoplot() (spatial_rset class).
+# Optionally subsample repeats (for racing).
+fun_4 <- function(fold_plan, subsample_repeats = NULL, subsample_seed = 1) {
+  bits <- fold_plan$bits
+  v <- fold_plan$v
+  repeats <- fold_plan$repeats
+  
+  reps_to_use <- seq_len(repeats)
+  if (!is.null(subsample_repeats) && subsample_repeats < repeats) {
+    set.seed(subsample_seed)
+    reps_to_use <- sort(sample(reps_to_use, subsample_repeats))
+  }
+  
+  splits <- list()
+  id <- character()
+  id2 <- character()
+  
+  for (rr in seq_along(reps_to_use)) {
+    r <- reps_to_use[[rr]]
+    fold_map <- fold_plan$fold_maps[[r]]
+    
+    for (k in seq_len(v)) {
+      assess_blocks <- which(fold_map == k)
+      
+      assess_mask <- Reduce(`|`, bits$incl_bits[as.character(assess_blocks)])
+      excl_mask   <- Reduce(`|`, bits$excl_bits[as.character(assess_blocks)])
+      
+      assess_idx <- which(as.logical(assess_mask))
+      train_idx  <- which(!as.logical(excl_mask))
+      
+      sp <- rsample::make_splits(
+        x = list(analysis = train_idx, assessment = assess_idx),
+        data = bits$points,
+        class = c("spatial_rsplit")
+      )
+      
+      splits[[length(splits) + 1L]] <- sp
+      id[[length(id) + 1L]] <- paste0("Fold", k)
+      id2[[length(id2) + 1L]] <- paste0("Repeat", rr)
+    }
+  }
+  
+  rsample::new_rset(
+    splits = splits,
+    ids = tibble(id2 = id2, id = id),
+    attrib = list(v = v, repeats = length(reps_to_use), buffer = bits$buffer_dist),
+    subclass = c("spatial_rset", "rset")
   )
 }
 
 # =============================================================================
-# Usage pattern (end-to-end)
+# Example
+# plan <- fun_3(roi, pts, v=10, blocks_per_fold=20, repeats=100, buffer_dist=2000, seed=1)
+# rset_small <- fun_4(plan, subsample_repeats=15, subsample_seed=99)
+# rset_full  <- fun_4(plan)
+# finetune::tune_race_anova(wf, resamples=rset_small, grid=grid, ...)
+# spatialsample::autoplot(rset_small)
 # =============================================================================
-# Inputs you provide:
-#   roi_sf: sf POLYGON/MULTIPOLYGON (projected, meters)
-#   r:      terra SpatRaster (30 m) or points_sf directly
-#
-# Example skeleton:
-#
-# roi_sf <- st_read("roi.gpkg") |> st_transform(26910)   # example
-# r <- rast("your_30m_raster.tif") |> project("EPSG:26910")
-#
-# blocks_sf <- build_blocks(roi_sf, block_size_m = 2000)  # block size is your choice
-# points_sf <- raster_to_points_sf(r, roi_sf)
-#
-# pre_block <- precompute_pts_in_block(points_sf, blocks_sf)
-# pts_in_block <- pre_block$pts_in_block
-#
-# pts_in_buf <- precompute_pts_in_buf(points_sf, blocks_sf, buffer_m = 2000)
-#
-# all_pt_ids <- as_sorted_unique_int(points_sf$pt_id)
-# block_ids  <- blocks_sf$block_id
-#
-# folds_by_rep <- make_block_folds(block_ids, v = 10, reps = 130, seed = 123)
-#
-# # Generate all splits without further geometry:
-# manifests <- vector("list", length(folds_by_rep) * 10L)
-# idx <- 1L
-# for (r in seq_along(folds_by_rep)) {
-#   fm <- folds_by_rep[[r]]
-#   for (k in 1:10) {
-#     sp <- make_split(fm, k, pts_in_block, pts_in_buf, all_pt_ids)
-#     manifests[[idx]] <- split_manifest(r, k, sp)
-#     idx <- idx + 1L
-#   }
-# }
-# manifest_dt <- rbindlist(manifests, use.names = TRUE)
-#
-# manifest_dt now gives exact point-level train/assess membership with a strict 2 km rule.
-
-# =============================================================================
-# Scaling note: bitset acceleration (optional)
-# =============================================================================
-# If unions become your bottleneck at ~1300 splits, switch pts_in_buf (and/or
-# pts_in_block) to bitsets:
-#
-#   library(bit)
-#   n <- length(all_pt_ids)
-#   buf_bitsets <- lapply(pts_in_buf, function(ids) { b <- bit(n); b[ids] <- TRUE; b })
-#   # for fold:
-#   excluded_b <- Reduce(`|`, buf_bitsets[as.character(block_ids_assess)])
-#   train_ids  <- which(!excluded_b)
-#
-# This is typically very fast; memory cost is ~n/8 bytes per block bitset.
-
-
-
-
