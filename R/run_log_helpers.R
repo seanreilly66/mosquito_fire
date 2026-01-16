@@ -15,6 +15,8 @@ start_console_log <- function(path) {
   }
 }
 
+# Powershell: Get-Content path -Wait
+
 
 write_run_log_txt <- function(run_log, file) {
   
