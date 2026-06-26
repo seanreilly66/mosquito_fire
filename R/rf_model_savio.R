@@ -1,9 +1,10 @@
+home_root = file.path('/', 'global', 'home', 'users', 'seanreilly')
+scratch_root = file.path('/', 'global', 'scratch', 'users', 'seanreilly', 'mosquito_fire')
+
 Sys.setenv(
   OMP_NUM_THREADS = "1",
   MKL_NUM_THREADS = "1",
-  OPENBLAS_NUM_THREADS = "1",
-  VECLIB_MAXIMUM_THREADS = "1",
-  NUMEXPR_NUM_THREADS = "1"
+  OPENBLAS_NUM_THREADS = "1"
 )
 
 suppressPackageStartupMessages({
@@ -13,21 +14,22 @@ suppressPackageStartupMessages({
   library(spatialsample)
   library(sf)
   library(tictoc)
-  library(finetune)
+  # library(finetune)
   library(mirai)
 })
-source('R/run_log_helpers.R')
-source('R/plot_helpers.R')
-source('R/spatial_cv.R')
+source(file.path(home_root, 'R', 'run_log_helpers.R'))
+source(file.path(home_root, 'R', 'plot_helpers.R'))
+source(file.path(home_root, 'R', 'spatial_cv.R'))
 
 # ==============================================================================
 # Inputs
 # ==============================================================================
 
-burn_file  <- 'data/burn_severity/mosquito_rdnbr_mtbs.tif'     # RdNBR response
-metric_dir <- "data/fuelrasters"            # predictor rasters
 
-roi_gpkg = 'data/mosquito_fire.gpkg'
+burn_file <- file.path(scratch_root, "data", "burn_severity", "mosquito_cbi.tif") 
+metric_dir <- file.path(scratch_root, "data", "fuelrasters") 
+
+roi_gpkg = file.path(scratch_root, 'data', 'mosquito_fire.gpkg')
 roi_layer = 'mosquito_study_area'
 
 save_console = TRUE
@@ -37,11 +39,9 @@ initial_prop = 0.2
 v_folds = 5
 blocks_per_fold = 3
 tune_reps = 1
-fit_reps = 2
+fit_reps = 10
 buffer_dist = 2000
-plot_folds = FALSE
 n_fold_plots = 10
-plot_location = 'data/temp/folds'
 
 # rf parameters
 # ntrees defined in model setup below
@@ -52,11 +52,21 @@ view_tuning = TRUE
 tune_metric = 'ccc'
 recipe_info = TRUE
 
+tune_trees = 200
+cv_trees = 1000
+final_trees = 5000
+
+
 # session information
-run_type <- 'rf_pt_fuels_expanded_grid_test'
+run_type <- 'rf_cbi_pt_fuels'
 start_time <- Sys.time()
 run_id <- format(start_time, "%Y%m%d_%H%M%S")
-out_dir <- glue::glue('outputs/rf/{run_type}_{run_id}')
+
+test_run = FALSE
+sample_n = 1000
+
+
+out_dir <- file.path(scratch_root, "outputs", "rf", paste0(run_type, "_", run_id))
 dir.create(out_dir, recursive = TRUE)
 prefix <- file.path(out_dir, paste0(run_type, '_', run_id))
 
@@ -64,12 +74,19 @@ prefix <- file.path(out_dir, paste0(run_type, '_', run_id))
 # Prep
 # ==============================================================================
 
+total_cores <- as.integer(
+  Sys.getenv("SLURM_CPUS_PER_TASK", 
+    unset = Sys.getenv("SLURM_CPUS_ON_NODE", 
+      unset = parallel::detectCores())))
+outer_workers <- v_folds
+ranger_threads <- max(1L, total_cores %/% outer_workers) 
+
 # ------------------------------------------------------------------------------
 # Initialize console log
 # ------------------------------------------------------------------------------
 
 if (save_console) {
-  console_log <- start_console_log(paste0(prefix, '_console.txt'))
+  console_log <- start_console_log(paste0(prefix, '_console.txt'), split = FALSE)
 }
 
 tic('Full run')
@@ -99,6 +116,8 @@ input_df <- c(burn_rast, pred_rast) %>%
   as.points() %>%
   st_as_sf() %>%
   mutate(st_coordinates(geometry) |> as_tibble())
+
+# if (test_run) input_df <- input_df %>% sample_n(1000)
 
 rm(burn_rast, pred_rast)
 gc()
@@ -131,6 +150,16 @@ cat(
   )
 )
 
+# --- Initial split plot ---
+init_split_plot <- autoplot(init_split) + 
+  ggtitle('Initial split') 
+
+ggsave(plot = init_split_plot, 
+       filename = paste0(prefix, '_initial_split.png'),
+       width = 8, 
+       height = 6, 
+       dpi = 300)
+
 # ------------------------------------------------------------------------------
 # Spatial blocks
 # ------------------------------------------------------------------------------
@@ -161,37 +190,6 @@ fit_folds <- spatial_block_rset(
 n_tune_resamps <- nrow(tune_folds)
 n_fit_resamps <- nrow(fit_folds)
 
-# Plot folds to file
-if (plot_folds) {
-  
-  # --- Initial split plot ---
-  init_split_plot <- autoplot(init_split) + 
-    ggtitle('Initial split') 
-  
-  ggsave(plot = init_split_plot, filename = paste0(prefix, '_initial_split.png'))
-  
-  # --- Fold plots ---
-  dir.create(file.path(out_dir, 'folds'), recursive = TRUE)
-  
-  splits_sub <- fit_folds %>% 
-    slice_sample(n = n_fold_plots) %>%
-    mutate(plot_id = row_number())
-  
-  purrr::pwalk(splits_sub, function(splits, id, id2, plot_id, ...) {
-    p <- autoplot(splits) + 
-      ggtitle(paste('Fold:', id, '-', id2))
-    
-    ggsave(
-      plot = p,
-      filename = file.path(out_dir, 'folds', 
-                           sprintf('fold_%03d_%s_%s.png', plot_id, id2, id)),
-      width = 8, height = 6
-    )
-  })
-  
-  rm(splits_sub)
-}
-
 # ==============================================================================
 # Model recipe
 # ==============================================================================
@@ -213,24 +211,23 @@ if (recipe_info) {
 # ==============================================================================
 
 # Memory parallel:
-num_threads_outer = 10  # N data copies
-num_threads_inner = 1  # Compute per copy
-num_threads_final = 12
-tune_trees = 200
-cv_trees = 1000
+num_threads_outer = outer_workers  # N data copies
+num_threads_inner = ranger_threads  # Compute per copy
+num_threads_final = total_cores
+
 
 rf_model <- rand_forest(
   mtry = tune(),
   min_n = tune(),
-  trees = 200) %>%
+  trees = !!tune_trees) %>%
   set_mode('regression') %>%
   set_engine('ranger', 
-             num.threads = 4,
+             num.threads = !!num_threads_inner,
              verbose = FALSE,
              splitrule = 'variance',
-             replace = FALSE,
+             replace = TRUE,
              sample.fraction = 0.95,
-             min.bucket = tune(),
+             min.bucket = 3,
              max.depth = tune())
 
 rf_workflow <- workflow() %>%
@@ -251,16 +248,11 @@ tune_start_time <- Sys.time()
 
 n_predictors <- sum(rf_recipe$var_info$role == 'predictor')
 
-# rf_params <- parameters(
-#   mtry(range = c(1, n_predictors/mtry_frac)),
-#   min_n(range = c(2, min_n_upper))
-# )
-# 
-# set.seed(345)
-# rf_grid <- grid_space_filling(rf_params, size = grid_size)
-
-
-
+rf_grid <- expand.grid(
+  mtry = seq(30, n_predictors, 5),
+  min_n = c(5, 15, 25),
+  max.depth = c(25, 35, 45)
+)
 
 tic('tune')
 daemons(num_threads_outer)
@@ -283,13 +275,18 @@ daemons(0)
 
 
 rf_tuned_param <- rf_tune %>%
-  select_best(metric = tune_metric)
+  select_by_one_std_err(
+    metric = "ccc", 
+    max.depth,
+    desc(min_n),
+    mtry
+  )
 
 rf_tuned_model <- rf_model %>%
-  set_args(trees = 500)
+  set_args(trees = !!cv_trees)
 
 rf_tuned_workflow <- workflow() %>%
-  add_model(rf_model) %>%
+  add_model(rf_tuned_model) %>%
   add_recipe(rf_recipe) %>%
   finalize_workflow(rf_tuned_param) 
 
@@ -308,17 +305,21 @@ if (view_tuning) {
 
 # Write tuning outputs
 
-grid_plot <- ggplot(rf_grid, mapping = aes(x = mtry, y = min_n)) + geom_point()
+grid_plot <- ggplot(
+  data = rf_grid,
+  mapping = aes(x = mtry, y = min_n, color = max.depth |> as.factor())) + 
+  geom_jitter(width = 0.5, height = 0.5) +
+  scale_color_discrete()
 
 ggsave(plot = grid_plot, filename = paste0(prefix, '_grid.png'))
 
 tune_plot <- rf_tune %>%
   collect_metrics() %>%
-  mutate(mtry = factor(mtry)) %>%
-  ggplot(aes(min_n, mean, color = mtry)) +
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(mtry, mean , color = min_n)) +
   # geom_line(linewidth = 1.5, alpha = 0.6) +
   geom_point(size = 2) +
-  facet_wrap(~ .metric, scales = "free", ncol = 2) +
+  facet_grid(.metric ~ max.depth, scales = 'free', axes = 'all') +
   scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
 
 ggsave(plot = tune_plot, filename = paste0(prefix, '_tune.png'))
@@ -330,9 +331,6 @@ write_csv(rf_tuned_param, paste0(prefix, '_best_params.csv'))
 rf_tune %>% 
   collect_metrics() %>%
   write_csv(paste0(prefix, '_tune_metrics.csv'))
-
-rm(rf_grid, tune_folds)
-gc()
 
 tune_end_time <- Sys.time()
 
@@ -351,12 +349,11 @@ set.seed(4285)
 rf_cv <- rf_tuned_workflow %>%
   fit_resamples(
     resamples = fit_folds,
-    metrics = yardstick::metric_set(rmse, rsq),
+    metrics = yardstick::metric_set(ccc, rmse, rsq),
     control = control_resamples(
-      save_pred = TRUE,
-      pkgs = c('ranger', 'finetune', 'tidymodels', 'spatialsample'),
-      save_workflow = TRUE,
-      parallel_over = 'everything'
+      save_pred = FALSE,
+      pkgs = c('ranger', 'tidymodels', 'spatialsample'),
+      save_workflow = FALSE
     ))
 
 toc()
@@ -371,8 +368,6 @@ cv_results
 
 write_csv(cv_results, paste0(prefix, '_cv_metrics.csv'))
 
-rm(fit_folds)
-gc()
 cv_end_time <- Sys.time()
 
 # ==============================================================================
@@ -387,16 +382,21 @@ tic('final fit')
 rf_final_model <- rand_forest(
   mtry = tune(),
   min_n = tune(),
-  trees = 5000) %>%
+  trees = !!final_trees) %>%
   set_mode('regression') %>%
   set_engine(
     'ranger',
-    num.threads = num_threads_final,
+    num.threads = !!num_threads_final,
     importance = 'permutation',
     write.forest = TRUE,
     keep.inbag = TRUE,
     node.stats = TRUE,
-    seed = 8465
+    seed = 8465,
+    splitrule = 'variance',
+    replace = TRUE,
+    sample.fraction = 0.95,
+    min.bucket = 3,
+    max.depth = tune()
   )
 
 rf_final_workflow <- rf_workflow %>%
@@ -524,9 +524,9 @@ run_log <- list(
   model = list(
     type = "Random Forest",
     engine = "ranger",
-    ntree_tune = 200,
-    ntree_cv = 500,
-    ntree_final = 1000,
+    ntree_tune = tune_trees,
+    ntree_cv = cv_trees,
+    ntree_final = final_trees,
     engine_args = list(
       num.threads = num_threads_final,
       importance = "permutation",
@@ -539,7 +539,7 @@ run_log <- list(
   
   tuning = list(
     method = "tune_grid",
-    grid_size = nrows(rf_grid),
+    grid_size = nrow(rf_grid),
     min_n_upper = min_n_upper,
     tune_metric = tune_metric,
     selection_rule = "best",
